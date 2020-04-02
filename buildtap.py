@@ -1,6 +1,6 @@
 # build TAP-Windows NDIS 6.0 driver
 
-import sys, os, re, shutil, tarfile
+import sys, os, re, shutil, tarfile, subprocess
 
 import paths
 
@@ -16,6 +16,8 @@ class BuildTAPWindows(object):
         self.src = os.path.join(self.top, 'src')                     # src/openvpn dir
         if opt.tapinstall:
             self.top_tapinstall = os.path.realpath(opt.tapinstall)   # tapinstall dir
+            devcon_project_file = os.path.join(self.top_tapinstall, "devcon.sln")
+            self.using_prebuilt_tapinstall = not os.path.isfile(devcon_project_file)
         else:
             self.top_tapinstall = None
             if opt.package:
@@ -35,13 +37,20 @@ class BuildTAPWindows(object):
         # The installation script has a set of architecture-specific paths.
         # The driver kit build system has a set of architecture-specific parameters.
         # architecture -> build system parameter map
-        self.architecture_platform_map = {"i386": "Win32", "amd64": "x64"}
+        self.architecture_platform_map = {"i386": "Win32", "amd64": "x64", "arm64": "arm64"}
         # architecture -> build system folder name fragment map
-        self.architecture_platform_folder_map = {"i386": "", "amd64": "x64"}
+        self.architecture_platform_folder_map = {"i386": "", "amd64": "x64", "arm64": "arm64"}
         # supported arch names, also installation script folder names
         self.architectures_supported = self.architecture_platform_map.keys()
         # Release vs Debug
-        self.configuration = 'Debug' if opt.debug else 'Release'
+        if opt.debug and opt.hlk:
+            raise ValueError("--debug is mutually exclusive with --hlk!")
+        elif opt.debug:
+            self.configuration = 'Debug'
+        elif opt.hlk:
+            self.configuration = 'Hlk'
+        else:
+            self.configuration = 'Release'
 
         # driver signing options
         self.codesign = opt.codesign
@@ -54,6 +63,10 @@ class BuildTAPWindows(object):
         self.signtool_cmd = 'SignTool.exe'
 
         self.timestamp_server = opt.timestamp
+
+        # Allow overriding settings in version.m4. Useful when several
+        # differently named tap-windows6 drivers have to be built.
+        self.versionoverride = opt.versionoverride
 
     # split a path into a list of components
     @staticmethod
@@ -72,10 +85,8 @@ class BuildTAPWindows(object):
 
     # run a command
     def system(self, cmd):
-        print "RUN:", cmd
-        result = os.system(cmd)
-        if result != 0:
-            raise ValueError("command failed")
+        print("RUN:", cmd)
+        subprocess.call(cmd, shell=True)
 
     # make a directory
     def mkdir(self, dir):
@@ -84,7 +95,7 @@ class BuildTAPWindows(object):
         except:
             pass
         else:
-            print "MKDIR", dir
+            print("MKDIR", dir)
 
     # make a directory including parents
     def makedirs(self, dir):
@@ -93,11 +104,11 @@ class BuildTAPWindows(object):
         except:
             pass
         else:
-            print "MAKEDIRS", dir
+            print("MAKEDIRS", dir)
 
     # copy a file
     def cp(self, src, dest):
-        print "COPY %s %s" % (src, dest)
+        print("COPY %s %s" % (src, dest))
         shutil.copy2(src, dest)
 
     # make a tarball
@@ -108,16 +119,16 @@ class BuildTAPWindows(object):
         tar = tarfile.open(output_filename, "w:gz")
         tar.add(source_dir, arcname=arcname)
         tar.close()
-        print "***** Generated tarball:", output_filename
+        print("***** Generated tarball:", output_filename)
 
     # remove a file
     def rm(self, file):
-        print "RM", file
+        print("RM", file)
         os.remove(file)
 
     # remove whole directory tree, like rm -rf
     def rmtree(self, dir):
-        print "RMTREE", dir
+        print("RMTREE", dir)
         shutil.rmtree(dir, ignore_errors=True)
 
     # return path of dist directory
@@ -144,11 +155,11 @@ class BuildTAPWindows(object):
             # within Visual Studio Command Prompt already.
             self.system(cmd)
 
-    # parse version.m4 file
-    def parse_version_m4(self):
+    # parse version.m4 files
+    def parse_version_m4(self, versionfile="version.m4"):
         kv = {}
         r = re.compile(r'^define\(\[?(\w+)\]?,\s*\[(.*)\]\)')
-        with open(os.path.join(self.top, 'version.m4')) as f:
+        with open(os.path.join(self.top, versionfile)) as f:
             for line in f:
                 line = line.rstrip()
                 m = re.match(r, line)
@@ -159,13 +170,9 @@ class BuildTAPWindows(object):
 
     # our tap-windows version.m4 settings
     def gen_version_m4(self):
-        kv = self.parse_version_m4()
-        if self.opt.oas: # for OpenVPN Connect (i.e. OpenVPN Access Server)
-            kv['PRODUCT_NAME'] = "OpenVPNAS"
-            kv['PRODUCT_TAP_WIN_DEVICE_DESCRIPTION'] = "TAP Adapter OAS NDIS 6.0"
-            kv['PRODUCT_TAP_WIN_PROVIDER'] = "TAP-Win32 Provider OAS"
-            kv['PRODUCT_TAP_WIN_COMPONENT_ID'] = "tapoas"
-
+        kv = dict(self.parse_version_m4())
+        if self.versionoverride:
+            kv.update(self.parse_version_m4(self.versionoverride))
         return kv
 
     # return tapinstall source directory
@@ -244,11 +251,11 @@ class BuildTAPWindows(object):
 
     # build, sign, and verify tap driver
     def build_tap(self):
-        print "***** BUILD TAP config"
+        print("***** BUILD TAP config")
         self.config_tap()
         project_file = os.path.join(self.src, "tap-windows6.vcxproj")
         for arch in self.architectures_supported:
-            print "***** BUILD TAP arch=%s" % (arch,)
+            print("***** BUILD TAP arch=%s" % (arch,))
             self.build_ewdk(project_file=project_file, arch=arch)
             self.copy_tap_to_dist(arch=arch)
             if self.codesign:
@@ -257,12 +264,11 @@ class BuildTAPWindows(object):
     # build tapinstall
     def build_tapinstall(self):
         project_file = os.path.join(self.tapinstall_src(), "devcon.sln")
-        using_prebuilt = not os.path.isfile(project_file)
 
         for arch in self.architectures_supported:
-            print "***** BUILD TAPINSTALL arch=%s" % (arch,)
-            if using_prebuilt:
-                print "***** BUILD TAPINSTALL - devcon solution file not found; relying on prebuilt binary"
+            print("***** BUILD TAPINSTALL arch=%s" % (arch,))
+            if self.using_prebuilt_tapinstall:
+                print("***** BUILD TAPINSTALL - devcon solution file not found; relying on prebuilt binary")
             else:
                 self.build_ewdk(project_file=project_file, arch=arch)
             self.copy_tapinstall_to_dist(arch)
@@ -277,10 +283,10 @@ class BuildTAPWindows(object):
             self.build_tapinstall()
         self.copy_dist_src_to_dist()
 
-        print "***** Generated files"
+        print("***** Generated files")
         self.dump_dist()
 
-        tapbase = "tapoas6" if self.opt.oas else "tap6"
+        tapbase = "tap6"
         self.make_tarball(os.path.join(self.top, tapbase+".tar.gz"),
                           self.dist_path(),
                           tapbase)
@@ -306,21 +312,17 @@ class BuildTAPWindows(object):
         # Get variables from version.m4
         kv = self.gen_version_m4()
 
-        installer_type = ""
-        if self.opt.oas:
-            installer_type = "-oas"
-        installer_file=os.path.join(self.top, 'tap-windows'+installer_type+'-'+kv['PRODUCT_VERSION']+'-I'+kv['PRODUCT_TAP_WIN_BUILD']+'.exe')
+        installer_file=os.path.join(self.top, 'tap-windows-'+kv['PRODUCT_VERSION']+'-I'+kv['PRODUCT_TAP_WIN_BUILD']+'.exe')
 
-        installer_cmd = "\"\"%s\" -DDEVCON32=%s -DDEVCON64=%s -DDEVCON_BASENAME=%s -DPRODUCT_TAP_WIN_COMPONENT_ID=%s -DPRODUCT_NAME=%s -DPRODUCT_PUBLISHER=\"%s\" -DPRODUCT_VERSION=%s -DPRODUCT_TAP_WIN_BUILD=%s -DOUTPUT=%s -DIMAGE=%s %s\"" % \
+        installer_variables_generator = ("\"-D%s=%s\"" % (k, v) for k, v in kv.items())
+
+        installer_cmd = "\"%s\" -DDEVCON32=%s -DDEVCON64=%s -DDEVCONARM64=%s -DDEVCON_BASENAME=%s %s -DOUTPUT=%s -DIMAGE=%s %s" % \
                         (self.makensis,
                          self.tifile_dst(arch="i386"),
                          self.tifile_dst(arch="amd64"),
+                         self.tifile_dst(arch="arm64"),
                          'tapinstall.exe',
-                         kv['PRODUCT_TAP_WIN_COMPONENT_ID'],
-                         kv['PRODUCT_NAME'],
-                         kv['PRODUCT_PUBLISHER'],
-                         kv['PRODUCT_VERSION'],
-                         kv['PRODUCT_TAP_WIN_BUILD'],
+                         " ".join(installer_variables_generator),
                          installer_file,
                          self.dist_path(),
                          os.path.join(self.top, 'installer', 'tap-windows6.nsi')
@@ -343,7 +345,7 @@ class BuildTAPWindows(object):
     # show files in dist
     def dump_dist(self):
         for f in self.enum_tree(self.dist_path()):
-            print f
+            print(f)
 
     # remove generated files from given directory tree
     def clean_tree(self, top):
@@ -354,7 +356,7 @@ class BuildTAPWindows(object):
                 else:
                     path = os.path.join(dirpath, d)
                     deldir = False
-                    if d in ('x64', 'Debug', 'Release', 'dist'):
+                    if d in ('ARM64', 'arm64', 'amd64', 'i386', 'x64', 'Hlk', 'Debug', 'Release', 'include'):
                         deldir = True
                     if deldir:
                         self.rmtree(path)
@@ -373,8 +375,9 @@ class BuildTAPWindows(object):
 
     # remove generated files for both tap-windows and tapinstall
     def clean(self):
-        self.clean_tree(self.top)
-        if self.top_tapinstall:
+        self.clean_tree(self.src)
+        self.clean_tree(self.dist_path())
+        if not self.using_prebuilt_tapinstall:
             self.clean_tree(self.top_tapinstall)
 
     # Calculate tapinstall.exe file names
@@ -401,8 +404,10 @@ class BuildTAPWindows(object):
             oslist = "Vista_X64,Server2008_X64,Server2008R2_X64,7_X64"
         elif arch == "i386":
             oslist = "Vista_X86,Server2008_X86,7_X86"
+        elif arch == "arm64":
+            oslist = "10_ARM64"
         else:
-            print "ERROR: inf2cat OS list not known for architecture %s!!" % (arch)
+            print("ERROR: inf2cat OS list not known for architecture %s!!" % (arch))
         self.run_ewdk("%s /driver:%s /os:%s" % (self.inf2cat_cmd, self.mkdir_dist(arch), oslist))
 
     def sign(self, file):
@@ -453,17 +458,19 @@ if __name__ == '__main__':
     src = os.path.dirname(os.path.realpath(__file__))
     sdk = "ewdk"
     cert = "openvpn"
+    versionoverride = False
     crosscert = "MSCV-VSClass3.cer" # cross certs available here: http://msdn.microsoft.com/en-us/library/windows/hardware/dn170454(v=vs.85).aspx
     timestamp = "http://timestamp.verisign.com/scripts/timstamp.dll"
 
     op.add_option("-s", "--src", dest="src", metavar="SRC",
-
                   default=src,
                   help="TAP-Windows top-level directory, default=%s" % (src,))
     op.add_option("--ti", dest="tapinstall", metavar="TAPINSTALL",
                   help="tapinstall (i.e. devcon) directory (optional)")
     op.add_option("-d", "--debug", action="store_true", dest="debug",
                   help="enable debug build")
+    op.add_option("--hlk", action="store_true", dest="hlk",
+                  help="build for HLK tests (test sign, no debug)")
     op.add_option("-c", "--clean", action="store_true", dest="clean",
                   help="do an nmake clean before build")
     op.add_option("-b", "--build", action="store_true", dest="build",
@@ -488,8 +495,9 @@ if __name__ == '__main__':
     op.add_option("--timestamp", dest="timestamp", metavar="URL",
                   default=timestamp,
                   help="Timestamp URL to use, default=%s" % (timestamp,))
-    op.add_option("-a", "--oas", action="store_true", dest="oas",
-                  help="Build for OpenVPN Access Server clients")
+    op.add_option("--versionoverride", dest="versionoverride", metavar="FILE",
+                  default=versionoverride,
+                  help="Path to the version override file")
     (opt, args) = op.parse_args()
 
     if len(sys.argv) <= 1:

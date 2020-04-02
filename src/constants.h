@@ -38,21 +38,9 @@
 //
 // Define the NDIS miniport interface version that this driver targets.
 //
-#if defined(NDIS60_MINIPORT)
-#  define TAP_NDIS_MAJOR_VERSION    6
-#  define TAP_NDIS_MINOR_VERSION    0
-#elif defined(NDIS61_MINIPORT)
-#  define TAP_NDIS_MAJOR_VERSION    6
-#  define TAP_NDIS_MINOR_VERSION    1
-#elif defined(NDIS620_MINIPORT)
-#  define TAP_NDIS_MAJOR_VERSION    6
-#  define TAP_NDIS_MINOR_VERSION    20
-#elif defined(NDIS630_MINIPORT)
-#  define TAP_NDIS_MAJOR_VERSION    6
-#  define TAP_NDIS_MINOR_VERSION    30
-#else
-#define TAP_NDIS_MAJOR_VERSION      5
-#define TAP_NDIS_MINOR_VERSION      0
+
+#if !defined(NDIS620_MINIPORT) || !defined(NDIS630_MINIPORT)
+#error "tap-windows6 only supports NDIS 6.20 and 6.30 at this time"
 #endif
 
 //===========================================================
@@ -102,7 +90,9 @@
 #define TAP_MAX_MCAST_LIST                 32
 
 #define TAP_MAX_LOOKAHEAD                  TAP_FRAME_MAX_DATA_SIZE
-#define TAP_BUFFER_SIZE                    TAP_MAX_FRAME_SIZE
+
+// Simulated send/receive buffer size for the virtual device.
+#define TAP_BUFFER_SIZE                    0x400000
 
 // Set this value to TRUE if there is a physical adapter.
 #define TAP_HAS_PHYSICAL_CONNECTOR         FALSE
@@ -111,14 +101,14 @@
 #define TAP_CONNECTION_TYPE                NET_IF_CONNECTION_DEDICATED
 
 // This value must match the *IfType in the driver .inf file
-#define TAP_IFTYPE                         IF_TYPE_ETHERNET_CSMACD
+#define TAP_IFTYPE                         IF_TYPE_PROP_VIRTUAL
 
 //
 // This is a virtual device, so it can tolerate surprise removal and
 // suspend.  Ensure the correct flags are set for your hardware.
 //
 #define TAP_ADAPTER_ATTRIBUTES_FLAGS (\
-                NDIS_MINIPORT_ATTRIBUTES_SURPRISE_REMOVE_OK | NDIS_MINIPORT_ATTRIBUTES_NDIS_WDM)
+                NDIS_MINIPORT_ATTRIBUTES_SURPRISE_REMOVE_OK | NDIS_MINIPORT_ATTRIBUTES_NDIS_WDM | NDIS_MINIPORT_ATTRIBUTES_NO_HALT_ON_SUSPEND)
 
 #define TAP_SUPPORTED_FILTERS ( \
                 NDIS_PACKET_TYPE_DIRECTED   | \
@@ -149,7 +139,8 @@
 #define TAP_MAC_OPTIONS (\
                 NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA | \
                 NDIS_MAC_OPTION_TRANSFERS_NOT_PEND  | \
-                NDIS_MAC_OPTION_NO_LOOPBACK)
+                NDIS_MAC_OPTION_NO_LOOPBACK | \
+                NDIS_MAC_OPTION_8021P_PRIORITY)
 
 #define TAP_ADAPTER_CHECK_FOR_HANG_TIME_IN_SECONDS 4
 

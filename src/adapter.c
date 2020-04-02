@@ -102,11 +102,34 @@ tapAdapterContextAllocate(
 
         adapter->MiniportAdapterHandle = MiniportAdapterHandle;
 
+        nblPoolParameters.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        nblPoolParameters.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        nblPoolParameters.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        nblPoolParameters.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
+        nblPoolParameters.ContextSize = 0;
+        //nblPoolParameters.ContextSize = sizeof(RX_NETBUFLIST_RSVD);
+        nblPoolParameters.fAllocateNetBuffer = TRUE;
+        nblPoolParameters.PoolTag = TAP_RX_NBL_TAG;
+
+        adapter->ReceiveNblPool = NdisAllocateNetBufferListPool(
+            adapter->MiniportAdapterHandle,
+            &nblPoolParameters); 
+
+        if (adapter->ReceiveNblPool == NULL)
+        {
+            DEBUGP (("[TAP] Couldn't allocate adapter receive NBL pool\n"));
+            NdisFreeMemory(adapter,0,0);
+            return NULL;
+        }
+
         // Initialize cancel-safe IRP queue
         tapIrpCsqInitialize(&adapter->PendingReadIrpQueue);
 
         // Initialize TAP send packet queue.
         tapPacketQueueInitialize(&adapter->SendPacketQueue);
+
+        // Initialize flow control
+        KeInitializeSpinLock(&adapter->FlowControlLock);
 
         // Allocate the adapter lock.
         NdisAllocateSpinLock(&adapter->AdapterLock);
@@ -117,25 +140,7 @@ tapAdapterContextAllocate(
         // Initialize event used to determine when all receive NBLs have been returned.
         NdisInitializeEvent(&adapter->ReceiveNblInFlightCountZeroEvent);
 
-        nblPoolParameters.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
-        nblPoolParameters.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
-        nblPoolParameters.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
-        nblPoolParameters.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
-        nblPoolParameters.ContextSize = 0;
-        //nblPoolParameters.ContextSize = sizeof(RX_NETBUFLIST_RSVD);
-        nblPoolParameters.fAllocateNetBuffer = TRUE;
-        nblPoolParameters.PoolTag = TAP_RX_NBL_TAG;
 
-#pragma warning( suppress : 28197 )
-        adapter->ReceiveNblPool = NdisAllocateNetBufferListPool(
-            adapter->MiniportAdapterHandle,
-            &nblPoolParameters); 
-
-        if (adapter->ReceiveNblPool == NULL)
-        {
-            DEBUGP (("[TAP] Couldn't allocate adapter receive NBL pool\n"));
-            NdisFreeMemory(adapter,0,0);
-        }
 
         // Add initial reference. Normally removed in AdapterHalt.
         adapter->RefCount = 1;
@@ -153,55 +158,46 @@ tapAdapterContextAllocate(
 }
 
 VOID
-tapReadPermanentAddress(
+tapReadCurrentAddress(
     __in PTAP_ADAPTER_CONTEXT   Adapter,
     __in NDIS_HANDLE            ConfigurationHandle,
-    __out MACADDR               PermanentAddress
+    __out MACADDR               CurrentAddress
     )
 {
     NDIS_STATUS status;
-    NDIS_CONFIGURATION_PARAMETER *configParameter;
-    NDIS_STRING macKey = NDIS_STRING_CONST("MAC");
-    ANSI_STRING macString;
-    BOOLEAN macFromRegistry = FALSE;
+    PUCHAR configAddress;
+    UINT configAddressLength = 0;
 
-    // Read MAC parameter from registry.
-    NdisReadConfiguration(
+    // Read MAC parameter from registry. (NetworkAddress keyword)
+    // Using NdisReadNetworkAddress is necessary.
+    // It causes NDIS to set a flag indicating the MAC address can be changed.
+    // NdisReadNetworkAddress converts to a byte array from a string.
+    NdisReadNetworkAddress(
         &status,
-        &configParameter,
-        ConfigurationHandle,
-        &macKey,
-        NdisParameterString
+        &configAddress,
+        &configAddressLength,
+        ConfigurationHandle
         );
 
-    if (status == NDIS_STATUS_SUCCESS)
+    if (status == NDIS_STATUS_SUCCESS && configAddressLength == 6)
     {
-        if( (configParameter->ParameterType == NdisParameterString)
-            && (configParameter->ParameterData.StringData.Length >= 12)
-            )
+        
+        if ((ETH_IS_MULTICAST(configAddress)
+                || ETH_IS_BROADCAST(configAddress))
+                || !NIC_ADDR_IS_LOCALLY_ADMINISTERED(configAddress))
         {
-            if (RtlUnicodeStringToAnsiString(
-                    &macString,
-                    &configParameter->ParameterData.StringData,
-                    TRUE) == STATUS_SUCCESS
-                    )
-            {
-                macFromRegistry = ParseMAC (PermanentAddress, macString.Buffer);
-                RtlFreeAnsiString (&macString);
-            }
+            // Address is invalid.
+            DEBUGP (("[TAP] --> NetworkAddress in the registry is invalid, using default address.\n"));
+        }
+        else
+        {
+            ETH_COPY_NETWORK_ADDRESS(CurrentAddress, configAddress);
+            return;
         }
     }
 
-    if(!macFromRegistry)
-    {
-        //
-        // There is no (valid) address stashed in the registry parameter.
-        //
-        // Make up a dummy mac address based on the ANSI representation of the
-        // NetCfgInstanceId GUID.
-        //
-        GenerateRandomMac(PermanentAddress, MINIPORT_INSTANCE_ID(Adapter));
-    }
+    // If we did not get a custom address, copy the existing permanent address
+    ETH_COPY_NETWORK_ADDRESS(CurrentAddress, Adapter->PermanentAddress);
 }
 
 NDIS_STATUS
@@ -396,12 +392,9 @@ tapReadConfiguration(
                 }
             }
 
-            // Read MAC PermanentAddress setting from registry.
-            tapReadPermanentAddress(
-                Adapter,
-                configHandle,
-                Adapter->PermanentAddress
-                );
+            // Adapter Permanent Address is expected to be a fixed value shipped with a NIC
+            // As a proxy, generate an address based on the device instance.
+            GenerateRandomMac(Adapter->PermanentAddress, (PUCHAR)MINIPORT_INSTANCE_ID(Adapter));
 
             DEBUGP (("[%s] Using MAC PermanentAddress %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
                 MINIPORT_INSTANCE_ID (Adapter),
@@ -413,8 +406,13 @@ tapReadConfiguration(
                 Adapter->PermanentAddress[5])
                 );
 
-            // Now seed the current MAC address with the permanent address.
-            ETH_COPY_NETWORK_ADDRESS(Adapter->CurrentAddress, Adapter->PermanentAddress);
+
+            // If a custom MAC address is configured, use it as the Current Address.
+            tapReadCurrentAddress(
+                Adapter,
+                configHandle,
+                Adapter->CurrentAddress
+                );
 
             DEBUGP (("[%s] Using MAC CurrentAddress %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
                 MINIPORT_INSTANCE_ID (Adapter),
@@ -522,6 +520,12 @@ tapAdapterContextFromDeviceObject(
 {
     LOCK_STATE_EX           lockState;
 
+    if(DeviceObject == NULL)
+    {
+        // Null DeviceObject could match a DiagDeviceObject if TapDiag is disabled.
+        return (PTAP_ADAPTER_CONTEXT )NULL;
+    }
+
     // Acquire global adapter list lock.
     NdisAcquireRWLockRead(
         GlobalData.Lock,
@@ -538,8 +542,9 @@ tapAdapterContextFromDeviceObject(
         {
             adapter = CONTAINING_RECORD(entry, TAP_ADAPTER_CONTEXT, AdapterListLink);
 
-            // Match on DeviceObject
-            if(adapter->DeviceObject == DeviceObject )
+            // Match on DeviceObject or DiagDeviceObject
+            if(adapter->DeviceObject == DeviceObject ||
+               adapter->DiagDeviceObject == DeviceObject)
             {
                 // Add reference to adapter context.
                 tapAdapterContextReference(adapter);
@@ -653,16 +658,32 @@ AdapterCreate(
         status = tapReadConfiguration(adapter);
 
         //
+        // Default priority behavior
+        //
+        adapter->PriorityBehavior = TAP_PRIORITY_BEHAVIOR_NOPRIORITY;
+
+        //
         // Set the registration attributes.
         //
-        {C_ASSERT(sizeof(regAttributes) >= NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1);}
+
+        {C_ASSERT(sizeof(regAttributes) >= NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2);}
+
         regAttributes.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
-        regAttributes.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
-        regAttributes.Header.Revision = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
+
+        if (GlobalData.NdisVersion < NDIS_RUNTIME_VERSION_630)
+        {
+            regAttributes.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
+            regAttributes.Header.Revision = NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
+        }
+        else
+        {
+            regAttributes.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
+            regAttributes.Header.Revision = NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
+        }
 
         regAttributes.MiniportAdapterContext = adapter;
-        regAttributes.AttributeFlags = TAP_ADAPTER_ATTRIBUTES_FLAGS;
 
+        regAttributes.AttributeFlags = TAP_ADAPTER_ATTRIBUTES_FLAGS;
         regAttributes.CheckForHangTimeInSeconds = TAP_ADAPTER_CHECK_FOR_HANG_TIME_IN_SECONDS;
         regAttributes.InterfaceType = TAP_INTERFACE_TYPE;
 
@@ -845,6 +866,8 @@ AdapterCreate(
         if(adapter != NULL)
         {
             DEBUGP (("[TAP] Miniport State: Halted\n"));
+
+            DestroyTapDevice(adapter);
 
             //
             // Remove reference when adapter context was allocated
@@ -1518,8 +1541,15 @@ Return Value:
 {
     PTAP_ADAPTER_CONTEXT   adapter = (PTAP_ADAPTER_CONTEXT )MiniportAdapterContext;
 
-    UNREFERENCED_PARAMETER(ShutdownAction);
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
+
+    if(ShutdownAction == NdisShutdownBugCheck)
+    {
+        // In some NDIS6 versions, this function could be called during a bugcheck.
+        // (Starting in NDIS 6.3, this will only happen if we set a flag in adapter registration.)
+        // Under those circumstances, it's not safe to do any of the normal shutdown tasks in this function.
+        return;
+    }
 
     DEBUGP (("[TAP] --> AdapterShutdownEx\n"));
 
@@ -1573,10 +1603,97 @@ tapAdapterContextFree(
 
     Adapter->ReceiveNblPool = NULL;
 
+    // Flow control related
+    ASSERT(Adapter->FlowControlList == NULL);
+
     NdisFreeMemory(Adapter,0,0);
 
     DEBUGP (("[TAP] <-- tapAdapterContextFree\n"));
 }
+
+ULONG
+tapGetRawPacketFrameType(
+    __in PTAP_ADAPTER_CONTEXT    Adapter,
+    __in PVOID                   PacketBuffer,
+    __in ULONG                   PacketLength
+    )
+/*++
+
+Routine Description:
+
+    Reads the network frame's destination address to determine the type
+    (broadcast, multicast, etc)
+
+Arguments:
+
+    Adapter             Adapter context structure
+    PacketBuffer        Raw packet in memory to examine
+
+Return Value:
+    Some combination of the NDIS Packet type bit flags
+        NDIS_PACKET_TYPE_BROADCAST
+        NDIS_PACKET_TYPE_MULTICAST
+        NDIS_PACKET_TYPE_ALL_MULTICAST
+        NDIS_PACKET_TYPE_DIRECTED
+        NDIS_PACKET_TYPE_ALL_LOCAL
+
+--*/
+{
+    if(PacketLength < ETHERNET_HEADER_SIZE)
+    {
+        return 0;
+    }
+    
+    PETH_HEADER ethernetHeader = (PETH_HEADER)PacketBuffer;
+    ASSERT(ethernetHeader);
+
+    if (ETH_IS_BROADCAST(ethernetHeader->dest))
+    {
+        return NDIS_PACKET_TYPE_BROADCAST;
+    }
+    else if(ETH_IS_MULTICAST(ethernetHeader->dest))
+    {
+        // Determine if packet is in multicast list or not.
+        int address_match = 0;
+        for(ULONG i=0;i<Adapter->ulMCListSize;i++)
+        {
+            // Note: Counterintutive match code from this macro. 0 = match
+            ETH_COMPARE_NETWORK_ADDRESSES_EQ(
+                Adapter->MCList[i], 
+                ethernetHeader->dest, 
+                &address_match);
+            
+            if(address_match == 0)
+            {
+                // Address is in multicast list
+                return NDIS_PACKET_TYPE_MULTICAST | NDIS_PACKET_TYPE_ALL_MULTICAST;
+            }
+        }
+        // Address is muticast, but not in multicast list.
+        return NDIS_PACKET_TYPE_ALL_MULTICAST;
+    }
+    else
+    {
+        // Determine if packet is directed to our address or not.
+        int address_match = 0;
+        ETH_COMPARE_NETWORK_ADDRESSES_EQ(
+            Adapter->CurrentAddress, 
+            ethernetHeader->dest, 
+            &address_match);
+
+        if(address_match == 0)
+        {
+            return NDIS_PACKET_TYPE_DIRECTED;    
+        }
+        else
+        {
+            // Directed traffic but not directed to us.
+            return 0;
+        }
+    }
+
+}
+
 ULONG
 tapGetNetBufferFrameType(
     __in PNET_BUFFER       NetBuffer
@@ -1613,6 +1730,11 @@ Return Value:
                         );
 
     ASSERT(ethernetHeader);
+    if(ethernetHeader == NULL)
+    {
+        // This should never happen, but don't cause a bugcheck if it does.
+        return NDIS_PACKET_TYPE_DIRECTED;
+    }
 
     if (ETH_IS_BROADCAST(ethernetHeader->dest))
     {
@@ -1632,7 +1754,7 @@ Return Value:
 ULONG
 tapGetNetBufferCountsFromNetBufferList(
     __in PNET_BUFFER_LIST   NetBufferList,
-    __inout_opt PULONG      TotalByteCount      // Of all linked NBs
+    __out_opt PULONG        TotalByteCount      // Of all linked NBs
     )
 /*++
 
@@ -1681,6 +1803,11 @@ Return Value:
     return netBufferCount;
 }
 
+_Requires_lock_not_held_(Adapter->AdapterLock)
+_Acquires_lock_(Adapter->AdapterLock)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_saves_global_(SpinLock, Adapter)
+_IRQL_raises_(DISPATCH_LEVEL)
 VOID
 tapAdapterAcquireLock(
     __in    PTAP_ADAPTER_CONTEXT    Adapter,
@@ -1699,6 +1826,10 @@ tapAdapterAcquireLock(
     }
 }
 
+_Requires_lock_held_(Adapter->AdapterLock)
+_Releases_lock_(Adapter->AdapterLock)
+_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_restores_global_(SpinLock, Adapter)
 VOID
 tapAdapterReleaseLock(
     __in    PTAP_ADAPTER_CONTEXT    Adapter,

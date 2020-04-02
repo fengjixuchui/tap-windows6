@@ -74,12 +74,19 @@ typedef struct _TAP_GLOBAL
 
     NDIS_HANDLE         NdisDriverHandle;   // From NdisMRegisterMiniportDriver
 
+    UINT NdisVersion;
+
     BOOLEAN             RunningWindows8OrGreater;
+
+    BOOLEAN             EnableTapDiag;
 
 } TAP_GLOBAL, *PTAP_GLOBAL;
 
 
 // Global data
 extern TAP_GLOBAL      GlobalData;
+
+#define TAP_NDIS_MAJOR_VERSION ((UCHAR)(GlobalData.NdisVersion >> 16))
+#define TAP_NDIS_MINOR_VERSION ((UCHAR)(GlobalData.NdisVersion & 0xFF))
 
 #endif // __TAP_H

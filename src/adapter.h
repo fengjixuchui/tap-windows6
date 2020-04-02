@@ -29,7 +29,8 @@
 #define TAP_RX_NBL_TAG              ((ULONG)'RpaT')     // "TapR
 #define TAP_RX_INJECT_BUFFER_TAG    ((ULONG)'IpaT')     // "TapI
 
-#define TAP_MAX_NDIS_NAME_LENGTH     64     // 38 character GUID string plus extra..
+#define TAP_MAX_NDIS_NAME_LENGTH        64     // 38 character GUID string plus extra..
+#define TAP_MAX_NDIS_DIAG_NAME_LENGTH   96     // Diag name is a little longer
 
 // TAP receive indication NBL flag definitions.
 #define TAP_RX_NBL_FLAGS                    NBL_FLAGS_MINIPORT_RESERVED
@@ -40,6 +41,11 @@
 
 #define TAP_RX_NBL_FLAGS_IS_P2P             0x00001000
 #define TAP_RX_NBL_FLAGS_IS_INJECTED        0x00002000
+
+
+// True iff the given address was assigned by the local administrator
+#define NIC_ADDR_IS_LOCALLY_ADMINISTERED(_addr) \
+        (BOOLEAN)(((PUCHAR)(_addr))[0] & ((UCHAR)0x02))
 
 // MSDN Ref: http://msdn.microsoft.com/en-us/library/windows/hardware/ff560490(v=vs.85).aspx
 typedef
@@ -154,12 +160,26 @@ typedef struct _TAP_ADAPTER_CONTEXT
     BOOLEAN                     TapFileIsOpen;      // WAS: m_TapOpens
     LONG                        TapFileOpenCount;   // WAS: m_NumTapOpens
 
+    NDIS_STRING                 DiagDeviceName;
+    WCHAR                       DiagDeviceNameBuffer[TAP_MAX_NDIS_DIAG_NAME_LENGTH];
+
+    NDIS_STRING                 DiagLinkName;
+    WCHAR                       DiagLinkNameBuffer[TAP_MAX_NDIS_DIAG_NAME_LENGTH];
+
+    NDIS_HANDLE                 DiagDeviceHandle;
+    PDEVICE_OBJECT              DiagDeviceObject;
+
     // Cancel-Safe read IRP queue.
     TAP_IRP_CSQ                 PendingReadIrpQueue;
 
     // Queue containing TAP packets representing host send NBs. These are
     // waiting to be read by user-mode application.
     TAP_PACKET_QUEUE            SendPacketQueue;
+
+    // Transmit flow control
+    KSPIN_LOCK                  FlowControlLock;
+    PNET_BUFFER_LIST            FlowControlList;
+    BOOLEAN                     FlowControlHasPackets;
 
     // NBL pool for making TAP receive indications.
     NDIS_HANDLE                 ReceiveNblPool;
@@ -196,6 +216,8 @@ typedef struct _TAP_ADAPTER_CONTEXT
 
     ULONG                       PacketFilter;
     ULONG                       ulLookahead;
+
+    ULONG                       PriorityBehavior;
 
     //
     // Statistics
@@ -287,12 +309,21 @@ tapAdapterContextDereference(
     return refCount;
 }
 
+_Requires_lock_not_held_(Adapter->AdapterLock)
+_Acquires_lock_(Adapter->AdapterLock)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_saves_global_(SpinLock, Adapter)
+_IRQL_raises_(DISPATCH_LEVEL)
 VOID
 tapAdapterAcquireLock(
     __in    PTAP_ADAPTER_CONTEXT    Adapter,
     __in    BOOLEAN                 DispatchLevel
     );
 
+_Requires_lock_held_(Adapter->AdapterLock)
+_Releases_lock_(Adapter->AdapterLock)
+_IRQL_restores_global_(SpinLock, Adapter)
+_IRQL_requires_(DISPATCH_LEVEL)
 VOID
 tapAdapterReleaseLock(
     __in    PTAP_ADAPTER_CONTEXT    Adapter,
@@ -316,6 +347,13 @@ tapAdapterSendAndReceiveReady(
     );
 
 ULONG
+tapGetRawPacketFrameType(
+    __in PTAP_ADAPTER_CONTEXT    Adapter,
+    __in PVOID                   PacketBuffer,
+    __in ULONG                   PacketLength
+    );
+
+ULONG
 tapGetNetBufferFrameType(
     __in PNET_BUFFER       NetBuffer
     );
@@ -323,7 +361,7 @@ tapGetNetBufferFrameType(
 ULONG
 tapGetNetBufferCountsFromNetBufferList(
     __in PNET_BUFFER_LIST   NetBufferList,
-    __inout_opt PULONG      TotalByteCount      // Of all linked NBs
+    __out_opt PULONG        TotalByteCount      // Of all linked NBs
     );
 
 // Prototypes for standard NDIS miniport entry points

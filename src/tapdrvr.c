@@ -96,10 +96,70 @@ Arguments:
     NdisZeroMemory(&GlobalData, sizeof(GlobalData));
 
     //
-    // The ApaterList in the GlobalData structure is used to track multiple
+    // Check what NDIS version is supported by the OS
+    //
+    GlobalData.NdisVersion = NdisGetVersion();
+    if (GlobalData.NdisVersion < NDIS_RUNTIME_VERSION_620)
+    {
+        return NDIS_STATUS_UNSUPPORTED_REVISION;
+    }
+    if (GlobalData.NdisVersion == NDIS_RUNTIME_VERSION_620)
+    {
+        GlobalData.NdisVersion = NDIS_RUNTIME_VERSION_620;
+    }
+    if (GlobalData.NdisVersion > NDIS_RUNTIME_VERSION_620)
+    {
+        GlobalData.NdisVersion = NDIS_RUNTIME_VERSION_630;
+    }
+
+    //
+    // The AdapterList in the GlobalData structure is used to track multiple
     // adapters controlled by this miniport.
     //
     NdisInitializeListHead(&GlobalData.AdapterList);
+
+    //
+    // Determine whether to enable TapDiag devices
+    //
+    {
+        HANDLE              regKey = NULL;
+        NTSTATUS            result;
+        OBJECT_ATTRIBUTES   keyAttributes;
+        UNICODE_STRING      regValueName;
+
+        RtlInitUnicodeString(&regValueName, L"TapDiag");
+
+        InitializeObjectAttributes(&keyAttributes, RegistryPath, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        result = ZwOpenKey(&regKey, KEY_QUERY_VALUE, &keyAttributes);
+        if(NT_SUCCESS(result))
+        {
+            UCHAR                           partialInfoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD)];
+            PKEY_VALUE_PARTIAL_INFORMATION  partialInfo = (PKEY_VALUE_PARTIAL_INFORMATION)partialInfoBuffer;
+        ULONG                               resultLength = 0;
+
+            result = ZwQueryValueKey(
+                        regKey, 
+                        &regValueName, 
+                        KeyValuePartialInformation, 
+                        partialInfo, 
+                        sizeof(partialInfoBuffer), 
+                        &resultLength);
+
+            if(NT_SUCCESS(result))
+            {
+                if(partialInfo->Type == REG_DWORD)
+                {
+                    DWORD value = *((DWORD*)partialInfo->Data);
+
+                    GlobalData.EnableTapDiag = value != 0;
+                }   
+            }
+
+            ZwClose(regKey);
+        }
+    }
+
 
     do
     {
@@ -259,9 +319,6 @@ Return Value:
 
 --*/
 {
-    PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
-    UNICODE_STRING uniWin32NameString;
-
     DEBUGP (("[TAP] --> TapDriverUnload; version [%d.%d] %s %s unloaded\n",
         TAP_DRIVER_MAJOR_VERSION,
         TAP_DRIVER_MINOR_VERSION,
