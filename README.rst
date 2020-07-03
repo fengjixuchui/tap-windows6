@@ -20,6 +20,7 @@ The prerequisites for building are:
 - Git (not strictly required, but useful for running commands using bundled bash shell)
 - MakeNSIS (optional)
 - Prebuilt tapinstall.exe binaries (optional)
+- Visual Studio 2019 and WiX Toolset for MSM packaging (optional)
 
 Make sure you add Python's install directory (usually c:\\python27) to the PATH 
 environment variable.
@@ -44,6 +45,7 @@ View build script options::
     --sdk=SDK            SDK to use for building: ewdk or wdk, default=ewdk
     --sign               sign the driver files
     -p, --package        generate an NSIS installer from the compiled files
+    -m, --package-msm    generate a MSM installer from the compiled files
     --cert=CERT          Common name of code signing certificate,
                          default=openvpn
     --certfile=CERTFILE  Path to the code signing certificate
@@ -68,17 +70,17 @@ Building tapinstall (optional)
 ------------------------------
 
 The easiest way to build tapinstall is to clone the Microsoft driver samples
-and copy the source for devcon.exe into the tap-windows6 tree. Using PowerShell:
-::
-    git clone https://github.com/Microsoft/Windows-driver-samples
-    Copy-Item -Recurse Windows-driver-samples/setup/devcon tap-windows6
-    cd tap-windows6
-    python.exe buildtap.py -b --ti=devcon
+and copy the source for devcon.exe into the tap-windows6 tree. Using PowerShell::
+
+  $ git clone https://github.com/Microsoft/Windows-driver-samples
+  $ Copy-Item -Recurse Windows-driver-samples/setup/devcon tap-windows6
+  $ cd tap-windows6
+  $ python.exe buildtap.py -b --ti=devcon
 
 The build system also supports reuse of pre-built tapinstall.exe executables.
 To make sure the buildsystem finds the executables, create the following
-directory structure under tap-windows6 directory:
-::
+directory structure under tap-windows6 directory::
+
   devcon
   ├── Release
   │   └── devcon.exe
@@ -130,9 +132,8 @@ The recommended procedure is to use pre-built, cross-signed devcon.exe and use
 the WDK-generated key for signing the driver.
 
 First setup the directory with prebuilt devcon as described above.
-Then run the build with the --hlk option:
+Then run the build with the --hlk option::
 
-::
   $ python.exe buildtap.py -c -b --ti=devcon-prebuilt --hlk
 
 Release signing
@@ -157,20 +158,20 @@ run as Administrator; according to Microsoft documentation Inf2Cat, which
 Cross-Sign.ps1 uses to create (unsigned) catalog files, needs to run with
 administrator privileges.
 
-First produce cross-signed drivers and installers (Windows 7/8/8.1/Server 2012r2):
-::
-    $ python.exe buildtap.py -c -b --ti=devcon
-    $ sign\Cross-Sign.ps1 -SourceDir dist -Force
-    $ python.exe buildtap.py -p --ti=devcon
-    $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
+First produce cross-signed drivers and installers (Windows 7/8/8.1/Server 2012r2)::
+
+  $ python.exe buildtap.py -c -b --ti=devcon
+  $ sign\Cross-Sign.ps1 -SourceDir dist -Force
+  $ python.exe buildtap.py -p --ti=devcon
+  $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
 
 Note that the "-Force" option for Cross-Sign.ps1 is *required* except in the
 unlikely case you're appending a signature.
 
-Next produce a driver submission cabinet files for attestation signing:
-::
-    $ sign\Create-DriverSubmission.ps1
-    $ Get-ChildItem -Path disk1|sign\Sign-File.ps1
+Next produce a driver submission cabinet files for attestation signing::
+
+  $ sign\Create-DriverSubmission.ps1
+  $ Get-ChildItem -Path disk1|sign\Sign-File.ps1
 
 Three architecture-specific (i386, amd64, arm64) cabinet files are created.
 Submit these to Windows Dev Center for attestation signing. Take care to only
@@ -178,12 +179,12 @@ request signatures applicable for each architecture.
 
 After downloading the attestation-signed drivers as zip files put them into
 a temporary directory under the tap-windows6 directory. Then extract the drivers
-into the "dist" directory, produce an installer and sign it:
-::
-   $ cd tap-windows6
-   $ Get-ChildItem -Path tempdir -Filter "*.zip"|sign\Extract-DriverSubmission.ps1
-   $ python.exe buildtap.py -p --ti=devcon
-   $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
+into the "dist" directory, produce an installer and sign it::
+
+  $ cd tap-windows6
+  $ Get-ChildItem -Path tempdir -Filter "*.zip"|sign\Extract-DriverSubmission.ps1
+  $ python.exe buildtap.py -p --ti=devcon
+  $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
 
 Note that these steps will fail unless cross-signed tapinstall.exe is present
 in each architecture-specific directory (i386, amd64, arm64) under the "dist"
@@ -209,6 +210,63 @@ It is possible to build tap-windows6 without connectivity to the Internet but
 any attempt to timestamp the driver will fail. For this reason configure your 
 outbound proxy server before starting the build. Note that the command prompt 
 also needs to be restarted to make use of new proxy settings.
+
+MSM packaging
+-------------
+
+In order to build the MSM packages build and sign the driver first:
+
+- Build the TAP driver with buildtap.py and "-b" flag.
+- EV-sign the drivers
+- WHQL/Attestation-sign the drivers
+
+Place the signed drivers in a directory structure under tap-windows6
+directory. Each platform directory should contain the EV-signed driver with a
+"win10" subdirectory containing WHQL/Attestation signed driver for that
+platform::
+
+  dist
+  ├── amd64
+  │   ├── win10
+  │   │   ├── OemVista.inf
+  │   │   ├── tap0901.cat
+  │   │   └── tap0901.sys
+  │   ├── OemVista.inf
+  │   ├── tap0901.cat
+  │   └── tap0901.sys
+  ├── arm64
+  │   ├── win10
+  │   │   ├── OemVista.inf
+  │   │   ├── tap0901.cat
+  │   │   └── tap0901.sys
+  │   └── (Note: EV-signed driver for arm64 is not used.)
+  ├── dist
+  │   └── include
+  │       └── tap-windows.h
+  └── i386
+      ├── win10
+      │   ├── OemVista.inf
+      │   ├── tap0901.cat
+      │   └── tap0901.sys
+      ├── OemVista.inf
+      ├── tap0901.cat
+      └── tap0901.sys
+
+Building MSM packages requires Visual Studio 2019 (EWDK is not sufficient) and
+the WiX Toolset installed. In a Developer Command Prompt for Visual Studio
+2019, run::
+
+  $ python buildtap.py -m --sdk=wdk
+
+This will compile the installer.dll file with embedded drivers and package it
+as a platform-dependent tap-windows-<version>-<platform>.msm files.
+
+As the WiX Toolset does not support the arm64 platform yet, only amd64 and
+i386 MSM files are built.
+
+Optional: Consider EV-signing the MSM packages before deploying them. Thou,
+MSM signature is ignored when merging MSM into MSI package, users get a choice
+to validate the integrity of the downloaded MSM packages manually.
 
 License
 -------
