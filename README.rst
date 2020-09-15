@@ -99,8 +99,8 @@ Please note that the NSIS packaging (-p) step will fail if you don't have
 tapinstall.exe available. Also don't use the "-c" flag or the above directories
 will get wiped before MakeNSIS is able to find them.
 
-Install/Update/Remove
----------------------
+Developer Mode: Installing,  Removing and Replacing the Driver
+-------------------------------------------------
 
 The driver can be installed using a command-line tool, tapinstall.exe, which is
 bundled with OpenVPN and tap-windows installers. Note that in some versions of
@@ -112,17 +112,63 @@ tap-windows NDIS 6 driver follow these steps:
 - cd to **dist**
 - cd to **amd64**, **i386**, or **arm64** depending on your system's processor architecture.
 
-Install::
 
-  $ tapinstall install OemVista.inf TAP0901
+If you are actively developing the driver (e.g.: Edit, Compile, Debug, Loop...), you may not be signing your driver each time, thus you need to be aware of the following additional items.
 
-Update::
+Disable Secure Boot::
 
-  $ tapinstall update OemVista.inf TAP0901
+Unsigned drivers require disabling secure boot.
 
-Remove::
+- Secure Boot: Varies depending on PC Maker and/or the BIOS setting on your test machine.
+- https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/disabling-secure-boot
+- VMWare (one example): https://docs.vmware.com/en/VMware-vSphere/7.0/com.vmware.vsphere.vm_admin.doc/GUID-898217D4-689D-4EB5-866C-888353FE241C.html
+- Virtual Box: SecureBoot is not supported on Virtual Box
+- Parallels (MacOS) https://kb.parallels.com/en/124242 [With Parallels 15, it is enabled by default, use 0 to disable]
 
-  $ tapinstall remove TAP0901
+Enable Windows Test Mode::
+
+Test mode is also required.
+
+- Enable Windows Test Mode via BCEDIT
+- For details: https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/bcdedit-command-line-options
+- Specifically, ``bcdedit /set testsigning off`` or ``bcdedit /set testsigning on``
+- The result should be ``Test Mode`` in the bottom right corner of the windows screen.
+  
+Driver Installation::
+
+Notes
+
+- The command ``tapinstall install OemVista.inf TAP0901`` installs the driver
+- Because your driver is not signed, the ``tapinstall install`` step will pop up the "Big Scary Unsigned Driver Warning", you'll need to click OK.
+- As a result, the driver will be copied into the Windows Driver Store
+  
+Updating the Driver, and the Windows Driver Store::
+
+At some point, you will build a shinny new driver and need to test it.
+
+- The command ``tapinstall remove TAP0901`` - removes the driver
+- However, the previously approved driver is still in the Windows Driver Store
+- Typing ``tapinstall install ...`` now, only re-installs the old driver that was copied into the driver store.
+
+Key step: The driver needs to be removed from the driver store also.
+
+- Details: https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/cc730875(v=ws.11)
+    
+There is a script to do this, but it only works if you have not changed the text strings in your driver package
+
+- Script Location: https://github.com/mattock/tap-windows-scripts
+
+The manual steps are:
+  
+- Step 1 - Obtain a list of Installed drivers via the command: ``pnputil -e``, this will list all of the ``oemNUMBER.inf`` files that are in the driver store.
+- Step 2 - Find your driver in that list, it will be some ``oem<NUMBER>.inf`` file
+- Step 3 - To delete, use ``pnputil.exe /d oemNUMBER.inf``
+
+Finally use ``tapinstall install OemVista.inf TAP0901`` to install your driver
+
+Important::
+
+If you do not see the Big Scary Unsigned Driver Warning - Windows will use the old (not new) driver.
 
 Build for HLK tests
 -------------------
@@ -136,8 +182,8 @@ Then run the build with the --hlk option::
 
   $ python.exe buildtap.py -c -b --ti=devcon-prebuilt --hlk
 
-Release signing
----------------
+Release process and signing
+---------------------------
 
 Microsoft's driver signing requirements have tightened considerably over the
 last several years. Because of this this buildsystem no longer attempts to sign
@@ -150,23 +196,19 @@ produce release-signed tap-windows6 packages:
 - *Extract-DriverSubmission*: extract attestation-signed zip files
 - *Sign-File*: sign files (e.g. tap-windows6 installer or driver submission cabinet files)
 - *Sign-tap6.conf.ps1*: configuration file for all the scripts above
+- *Prepare-Msm.ps1*: take Win7- and Win10-signed "dist" directories and produce a "dist" directory that MSM packaging can consume
 
-With the exception of Sign-File these scripts operate on the "dist" directory
-that tap-windows6 build system produces. Below it is assumed that building and
-signing is done on the same computer. It is also assumed that Cross-Sign.ps1 is
-run as Administrator; according to Microsoft documentation Inf2Cat, which
-Cross-Sign.ps1 uses to create (unsigned) catalog files, needs to run with
-administrator privileges.
+Most of these scripts operate directly on the "dist" directory that
+tap-windows6 build system produces. Below it is assumed that building and
+signing is done on the same computer.
 
-First produce cross-signed drivers and installers (Windows 7/8/8.1/Server 2012r2)::
+First produce cross-signed drivers for (Windows 7/8/8.1/Server 2012r2)::
 
   $ python.exe buildtap.py -c -b --ti=devcon
   $ sign\Cross-Sign.ps1 -SourceDir dist -Force
-  $ python.exe buildtap.py -p --ti=devcon
-  $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
 
 Note that the "-Force" option for Cross-Sign.ps1 is *required* except in the
-unlikely case you're appending a signature.
+unlikely case that you're appending a signature.
 
 Next produce a driver submission cabinet files for attestation signing::
 
@@ -174,23 +216,50 @@ Next produce a driver submission cabinet files for attestation signing::
   $ Get-ChildItem -Path disk1|sign\Sign-File.ps1
 
 Three architecture-specific (i386, amd64, arm64) cabinet files are created.
-Submit these to Windows Dev Center for attestation signing. Take care to only
-request signatures applicable for each architecture.
+Submit these to Windows Dev Center for attestation signing. Note that unsigned
+cabinet files will be automatically rejected.
 
-After downloading the attestation-signed drivers as zip files put them into
-a temporary directory under the tap-windows6 directory. Then extract the drivers
-into the "dist" directory, produce an installer and sign it::
+When submitting the drivers to Microsoft take care to only request signatures
+applicable for each architecture.
 
-  $ cd tap-windows6
+At this point move the cross-signed "dist" directory away::
+
+  $ Move-Item dist dist.win7
+
+Download the attestation-signed drivers as zip files put them into a temporary
+directory (e.g. tap-windows6\tempdir). Then run Extract-DriverSubmission.ps1::
+
   $ Get-ChildItem -Path tempdir -Filter "*.zip"|sign\Extract-DriverSubmission.ps1
+
+This extracts the drivers into the "dist" directory. Move that directory to dist.win10::
+
+  $ Move-Item dist dist.win10
+
+After this you can start creating the installers and/or MSM packages.
+
+If you're creating NSIS packages do::
+
+  $ Move-Item dist.win7 dist
   $ python.exe buildtap.py -p --ti=devcon
+  $ Move-Item dist dist.win7
+
+Followed by::
+
+  $ Move-Item dist.win10 dist
+  $ python.exe buildtap.py -p --ti=devcon
+  $ Move-Item dist dist.win10
+
+Finally sign both installers::
+
   $ Get-Item tap-windows*.exe|sign\Sign-File.ps1
 
-Note that these steps will fail unless cross-signed tapinstall.exe is present
-in each architecture-specific directory (i386, amd64, arm64) under the "dist"
-directory.
+On the other hand if you're creating MSM packages do::
 
-For more detailed instructions and background information please refer to
+  $ sign\Prepare-Msm.ps1
+  $ python buildtap.py -m --sdk=wdk
+  $ Get-Item tap-windows*.msm|sign\Sign-File.ps1
+
+For additional instructions and background information please refer to
 `this article <https://community.openvpn.net/openvpn/wiki/BuildingTapWindows6>`_ on OpenVPN community wiki.
 
 Overriding setting defined in version.m4
@@ -240,9 +309,8 @@ platform::
   │   │   ├── tap0901.cat
   │   │   └── tap0901.sys
   │   └── (Note: EV-signed driver for arm64 is not used.)
-  ├── dist
-  │   └── include
-  │       └── tap-windows.h
+  ├── include
+  │   └── tap-windows.h
   └── i386
       ├── win10
       │   ├── OemVista.inf
